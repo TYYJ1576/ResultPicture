@@ -1,11 +1,11 @@
 # mmseg/core/hooks/progressive_expansion_hook.py
 
+from mmengine.hooks import Hook
+from mmengine.runner import Runner
+from mmseg.registry import HOOKS
 import copy
 import torch
 import torch.distributed as dist
-from mmengine.hooks import Hook
-from mmseg.apis import multi_gpu_test
-from mmseg.registry import HOOKS
 
 @HOOKS.register_module()
 class ProgressiveExpansionHook(Hook):
@@ -39,7 +39,7 @@ class ProgressiveExpansionHook(Hook):
             [0, 0, 1/8]
         ]
     
-    def before_run(self, runner):
+    def before_run(self, runner: Runner):
         # Initialize the model with the smallest architecture
         self.current_arch = {
             'depth': self.depth,
@@ -57,7 +57,7 @@ class ProgressiveExpansionHook(Hook):
             print(f'Initial Architecture: {self.current_arch}')
             print(f'Initial mIoU: {self.current_miou}, Latency: {self.current_latency}')
     
-    def before_train_epoch(self, runner):
+    def before_train_epoch(self, runner: Runner):
         if self.current_step >= self.max_steps:
             return  # Stop expanding after max_steps
     
@@ -79,7 +79,7 @@ class ProgressiveExpansionHook(Hook):
             print(f'Updated Architecture: {self.current_arch}')
             print(f'Updated mIoU: {self.current_miou}, Latency: {self.current_latency}')
     
-    def update_model_architecture(self, runner):
+    def update_model_architecture(self, runner: Runner):
         # Update the backbone and decode head
         if runner.world_rank == 0:
             backbone = runner.model.backbone
@@ -98,7 +98,7 @@ class ProgressiveExpansionHook(Hook):
         # Synchronize the updated model across GPUs
         self.sync_model_parameters(runner)
     
-    def sync_model_parameters(self, runner):
+    def sync_model_parameters(self, runner: Runner):
         # Synchronize model parameters across GPUs
         for param in runner.model.parameters():
             dist.broadcast(param.data, src=0)
@@ -132,7 +132,7 @@ class ProgressiveExpansionHook(Hook):
                 expanded_archs.append(new_arch)
         return expanded_archs
     
-    def select_best_architecture(self, expanded_archs, runner):
+    def select_best_architecture(self, expanded_archs, runner: Runner):
         best_slope = float('-inf')
         best_arch = None
         best_miou = None
@@ -169,23 +169,34 @@ class ProgressiveExpansionHook(Hook):
                 best_latency = latency
         return best_arch, best_miou, best_latency
     
-    def evaluate_miou(self, runner):
-        # Evaluate mIoU on validation dataset
-        model = runner.model
-        model.eval()
-        # Use multi_gpu_test for distributed evaluation
-        results = multi_gpu_test(model, runner.val_dataloader, tmpdir=None, gpu_collect=False)
-        if runner.world_rank == 0:
-            eval_results = runner.val_evaluator.evaluate(results)
-            miou = eval_results['mIoU']
-        else:
-            miou = 0.0
+    def evaluate_miou(self, runner: Runner):
+        # Evaluate mIoU using runner.test()
+        # Backup the original evaluator and dataloader
+        original_val_evaluator = runner.val_evaluator
+        original_val_loop = runner.val_loop
+        original_val_dataloader = runner.val_dataloader
+
+        # Temporarily set the evaluator and dataloader to validation ones
+        runner.val_evaluator = runner.test_evaluator
+        runner.val_loop = runner.test_loop
+        runner.val_dataloader = runner.test_dataloader
+
+        # Run evaluation
+        eval_results = runner.test()  # This runs the test loop
+
+        # Restore the original evaluator and dataloader
+        runner.val_evaluator = original_val_evaluator
+        runner.val_loop = original_val_loop
+        runner.val_dataloader = original_val_dataloader
+
+        # Get mIoU from evaluation results
+        miou = eval_results['mIoU']
         # Broadcast mIoU to all ranks
-        miou_tensor = torch.tensor(miou, device=next(model.parameters()).device)
+        miou_tensor = torch.tensor(miou, device=next(runner.model.parameters()).device)
         dist.broadcast(miou_tensor, src=0)
         return miou_tensor.item()
     
-    def measure_latency(self, runner):
+    def measure_latency(self, runner: Runner):
         # Measure latency of the model
         model = runner.model
         device = next(model.parameters()).device
@@ -216,4 +227,3 @@ class ProgressiveExpansionHook(Hook):
         latency_tensor = torch.tensor(latency, device=device)
         dist.broadcast(latency_tensor, src=0)
         return latency_tensor.item()
-
